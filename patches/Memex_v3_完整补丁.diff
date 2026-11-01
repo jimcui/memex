@@ -1,0 +1,853 @@
+diff --git a/android/app/src/main/AndroidManifest.xml b/android/app/src/main/AndroidManifest.xml
+index 4c328b4..222c5f9 100644
+--- a/android/app/src/main/AndroidManifest.xml
++++ b/android/app/src/main/AndroidManifest.xml
+@@ -3,7 +3,8 @@
+     <uses-permission android:name="android.permission.RECORD_AUDIO" />
+     <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" />
+     <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" />
+-    <!-- MANAGE_EXTERNAL_STORAGE removed for Google Play policy compliance -->
++    <!-- Android 11+ all files access for custom workspace folder (restored) -->
++    <uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE" tools:ignore="ScopedStorage" />
+     <uses-permission android:name="android.permission.CAMERA" />
+     <uses-permission android:name="android.permission.USE_BIOMETRIC"/>
+     <!-- Media location permission for accessing GPS info in images -->
+diff --git a/lib/ui/settings/widgets/data_storage_page.dart b/lib/ui/settings/widgets/data_storage_page.dart
+index 0ad6eea..dbdc6a3 100644
+--- a/lib/ui/settings/widgets/data_storage_page.dart
++++ b/lib/ui/settings/widgets/data_storage_page.dart
+@@ -2,6 +2,7 @@ import 'dart:io';
+ import 'package:flutter/material.dart';
+ import 'package:google_fonts/google_fonts.dart';
+ import 'package:file_picker/file_picker.dart';
++import 'package:permission_handler/permission_handler.dart';
+ import 'package:memex/data/repositories/memex_router.dart';
+ import 'package:memex/data/services/backup_service.dart';
+ import 'package:memex/utils/user_storage.dart';
+@@ -68,6 +69,32 @@ class _DataStoragePageState extends State<DataStoragePage> {
+     }
+   }
+ 
++
++  /// Ensure Android 11+ "All files access" is granted before picking a folder.
++  Future<bool> _ensureAllFilesAccess() async {
++    try {
++      final status = await Permission.manageExternalStorage.status;
++      if (status.isGranted) return true;
++      if (status.isPermanentlyDenied) {
++        await openAppSettings();
++        if (mounted) {
++          ToastHelper.showInfo(
++              context, UserStorage.l10n.customFolderAccessDenied);
++        }
++        return false;
++      }
++      final result = await Permission.manageExternalStorage.request();
++      if (result.isGranted) return true;
++      if (mounted) {
++        ToastHelper.showInfo(
++            context, UserStorage.l10n.customFolderAccessDenied);
++      }
++      return false;
++    } catch (_) {
++      return true; // 插件不可用时交给写测试判断
++    }
++  }
++
+   /// Verify we can read/write the path (create and delete a test file). Returns true if OK.
+   Future<bool> _verifyPathWritable(String path) async {
+     try {
+@@ -92,6 +119,9 @@ class _DataStoragePageState extends State<DataStoragePage> {
+       }
+       return;
+     }
++    if (!await _ensureAllFilesAccess()) {
++      return;
++    }
+     final path = await FilePicker.platform.getDirectoryPath();
+     if (path == null || path.isEmpty || !mounted) return;
+     final canWrite = await _verifyPathWritable(path);
+@@ -275,7 +305,8 @@ class _DataStoragePageState extends State<DataStoragePage> {
+       add(iCloudCard);
+       add(appCard);
+     } else {
+-      // Android: only app storage (custom folder removed for Google Play policy compliance)
++      // Android: restore custom folder option
++      add(customCard);
+       add(appCard);
+     }
+ 
+diff --git a/lib/data/model/chat_events.dart b/lib/data/model/chat_events.dart
+index 1e59fb9..757e3b7 100644
+--- a/lib/data/model/chat_events.dart
++++ b/lib/data/model/chat_events.dart
+@@ -59,6 +59,31 @@ class ChatErrorEvent extends ChatEvent {
+   ChatErrorEvent(this.turnId, this.error);
+ }
+ 
++/// Emitted before the (possibly slow) on-device OCR pass over outgoing
++/// images, and again with [isRunning] false when it finishes. Purely a UI
++/// progress signal — carries no payload the agent needs.
++class ChatOcrStatusEvent extends ChatEvent {
++  final String turnId;
++  final bool isRunning;
++  ChatOcrStatusEvent(this.turnId, {required this.isRunning});
++}
++
++/// Reports how many outgoing images were converted to text and therefore
++/// never copied into facts/assets.
++class ChatOcrDiscardedEvent extends ChatEvent {
++  final String turnId;
++  final int discardedCount;
++
++  /// Number of images that had no usable text and are sent as photos instead.
++  final int keptCount;
++
++  ChatOcrDiscardedEvent(
++    this.turnId, {
++    required this.discardedCount,
++    required this.keptCount,
++  });
++}
++
+ class ChatArtifactsEvent extends ChatEvent {
+   final String turnId;
+   final List<ChatArtifact> artifacts;
+diff --git a/lib/data/services/chat_service.dart b/lib/data/services/chat_service.dart
+index e9e4913..1a30881 100644
+--- a/lib/data/services/chat_service.dart
++++ b/lib/data/services/chat_service.dart
+@@ -21,6 +21,7 @@ import 'package:memex/domain/models/custom_agent_config.dart';
+ import 'package:memex/domain/models/location_context_config.dart';
+ import 'package:memex/domain/models/llm_config.dart';
+ import 'package:memex/data/services/file_system_service.dart';
++import 'package:memex/data/services/image_text_ocr_service.dart';
+ import 'package:memex/data/services/chat_session_storage.dart';
+ import 'package:memex/data/services/local_task_executor.dart';
+ import 'package:memex/utils/logger.dart';
+@@ -392,10 +393,52 @@ class ChatService {
+ 
+     String finalSessionId = sessionId ?? '';
+     final userMessageTime = DateTime.now();
+-    final trimmedMessage = message.trim();
++    var trimmedMessage = message.trim();
+     final preparedImages = <AgentImageAttachment>[];
+     String agentStateSessionId = '';
+ 
++    // When "discard original after OCR" is on, images that yield usable text
++    // are turned into text here and never reach _prepareChatImage — so no file
++    // is ever written to facts/assets for them. Images without text fall
++    // through to the normal attachment path untouched.
++    final ocrTexts = <String>[];
++    var keptImageCount = 0;
++    if (images.isNotEmpty && await UserStorage.getOcrDiscardImage()) {
++      yield ChatOcrStatusEvent(turnId, isRunning: true);
++      try {
++        final pendingImages = <XFile>[];
++        for (final image in images) {
++          final text = await ImageTextOcrService.instance.recognize(image.path);
++          if (ImageTextOcrService.instance.isUseful(text)) {
++            ocrTexts.add(text);
++          } else {
++            pendingImages.add(image);
++          }
++        }
++        if (ocrTexts.isNotEmpty) {
++          trimmedMessage = [
++            if (trimmedMessage.isNotEmpty) trimmedMessage,
++            for (final text in ocrTexts) '【${UserStorage.l10n.ocrTextPrefix}】\n$text',
++          ].join('\n\n');
++        }
++        images = pendingImages;
++        keptImageCount = pendingImages.length;
++      } finally {
++        yield ChatOcrStatusEvent(turnId, isRunning: false);
++      }
++      if (ocrTexts.isNotEmpty) {
++        _logger.info(
++          'OCR discard: ${ocrTexts.length} image(s) converted to text, '
++          '$keptImageCount kept as attachment(s)',
++        );
++        yield ChatOcrDiscardedEvent(
++          turnId,
++          discardedCount: ocrTexts.length,
++          keptCount: keptImageCount,
++        );
++      }
++    }
++
+     try {
+       for (final image in images) {
+         preparedImages.add(
+@@ -477,6 +520,7 @@ class ChatService {
+             'message_unix_seconds': unixSecondsFromDateTime(userMessageTime),
+             'has_refs': refs != null && refs.isNotEmpty,
+             'has_images': preparedImages.isNotEmpty,
++            'ocr_image_text_count': ocrTexts.length,
+             'is_quick_query': isQuickQuery,
+             'run_mode': runMode,
+           },
+@@ -513,6 +557,7 @@ class ChatService {
+           'run_mode': runMode,
+           'user_message_time': userMessageTime.toIso8601String(),
+           'agent_state_session_id': agentStateSessionId,
++          'ocr_image_text_count': ocrTexts.length,
+         },
+         // A chat turn is user-visible and should start promptly, but keep it
+         // below system maintenance work that may use higher explicit priority.
+@@ -594,6 +639,7 @@ class ChatService {
+       sceneId: sceneId,
+       refs: refs,
+       preparedImages: preparedImages,
++      ocrImageTextCount: payload['ocr_image_text_count'] as int? ?? 0,
+       isQuickQuery: isQuickQuery,
+       runMode: runMode,
+       userMessageTime: userMessageTime,
+@@ -613,6 +659,7 @@ class ChatService {
+     required String? sceneId,
+     required List<Map<String, String>>? refs,
+     required List<AgentImageAttachment> preparedImages,
++    int ocrImageTextCount = 0,
+     required bool isQuickQuery,
+     required String runMode,
+     required DateTime userMessageTime,
+@@ -959,6 +1006,9 @@ class ChatService {
+           // fs:// filename placeholders (see SuperAgentContextCompressor).
+           if (inlinedImageFileNames.isNotEmpty)
+             'image_fs_paths': inlinedImageFileNames,
++          // Tells the context compressor (and later turns) that some images of
++          // this turn exist only as text — there is no file to point at.
++          if (ocrImageTextCount > 0) 'ocr_image_text_count': ocrImageTextCount,
+         },
+       );
+       try {
+diff --git a/lib/data/services/file_system_service.dart b/lib/data/services/file_system_service.dart
+index ce5c029..782a672 100644
+--- a/lib/data/services/file_system_service.dart
++++ b/lib/data/services/file_system_service.dart
+@@ -1632,6 +1632,43 @@ class FileSystemService {
+     return '${assetType}_${dateStr}_ts_0_no_$index$extraPart.$extension';
+   }
+ 
++  /// Delete a single asset under `facts/assets`.
++  ///
++  /// [fileNameOrRelativePath] accepts either the bare filename returned by
++  /// [saveAssetFromFile] or the dataRoot-relative path it also returns. The
++  /// resolved file must stay inside the user's assets directory — anything
++  /// escaping it (via `..`, symlinks or an absolute path elsewhere) is refused.
++  ///
++  /// Returns true only when a file was actually removed. Assets have no index
++  /// table, so deleting the file is the whole cleanup. References to it
++  /// (`fs://<filename>`) simply resolve to "not found" afterwards.
++  Future<bool> deleteAsset({
++    required String userId,
++    required String fileNameOrRelativePath,
++  }) async {
++    if (fileNameOrRelativePath.trim().isEmpty) return false;
++    try {
++      final assetsPath = path.canonicalize(getAssetsPath(userId));
++      final absPath = path.isAbsolute(fileNameOrRelativePath)
++          ? path.canonicalize(fileNameOrRelativePath)
++          : path.canonicalize(
++              path.join(assetsPath, path.basename(fileNameOrRelativePath)),
++            );
++      if (!path.isWithin(assetsPath, absPath) && absPath != assetsPath) {
++        _logger.warning('Refusing to delete asset outside assets dir: $absPath');
++        return false;
++      }
++      final file = File(absPath);
++      if (!await file.exists()) return false;
++      await file.delete();
++      _logger.info('Deleted asset $absPath');
++      return true;
++    } catch (e) {
++      _logger.warning('Failed to delete asset $fileNameOrRelativePath: $e');
++      return false;
++    }
++  }
++
+   /// Save asset from file (direct copy, no Base64). Returns (filename, relativePath) under dataRoot.
+   Future<(String, String)> saveAssetFromFile({
+     required String userId,
+diff --git a/lib/data/services/image_text_ocr_service.dart b/lib/data/services/image_text_ocr_service.dart
+new file mode 100644
+index 0000000..b6d4c57
+--- /dev/null
++++ b/lib/data/services/image_text_ocr_service.dart
+@@ -0,0 +1,208 @@
++import 'dart:io';
++
++import 'package:flutter/foundation.dart';
++import 'package:google_mlkit_text_recognition/google_mlkit_text_recognition.dart';
++import 'package:image/image.dart' as img;
++import 'package:memex/data/services/asset_safety_service.dart';
++import 'package:memex/utils/logger.dart';
++
++final _logger = getLogger('ImageTextOcr');
++
++/// On-device OCR for chat image attachments.
++///
++/// Used only when the user turns on "discard original after OCR". The
++/// recognizer is the bundled Chinese ML Kit model
++/// (`com.google.mlkit:text-recognition-chinese`), so this never touches the
++/// network and never costs tokens.
++///
++/// Returns '' on any failure — callers must treat that as "no text" and keep
++/// the original image, never as "delete the image".
++class ImageTextOcrService {
++  ImageTextOcrService._();
++
++  static final ImageTextOcrService instance = ImageTextOcrService._();
++
++  /// A result shorter than this after trimming is noise (a single stray glyph,
++  /// a logo letter, a UI fragment), not content worth deleting a photo for.
++  static const int _minUsefulChars = 2;
++
++  /// Long edge above which the image is downsampled before OCR. Keeps a
++  /// 4000x3000 camera shot from costing several seconds.
++  static const int _maxLongEdge = 2000;
++
++  /// Recognize text in [imagePath]. Never throws.
++  ///
++  /// Returns '' on every failure path, so the caller keeps the photo.
++  Future<String> recognize(String imagePath) async {
++    TextRecognizer? recognizer;
++    String? tmpDirPath;
++    try {
++      final safety = await AssetSafetyService.instance.inspectFile(imagePath);
++      if (!safety.safeForOcr) {
++        _logger.info('OCR skipped for $imagePath: ${safety.reason}');
++        return '';
++      }
++
++      final w = safety.width;
++      final h = safety.height;
++      final longEdge = (w != null && h != null)
++          ? (w > h ? w : h)
++          : null;
++      final prepared = await _prepareInput(imagePath, longEdge);
++      if (prepared == null) return '';
++      tmpDirPath = prepared.tmpDirPath;
++
++      recognizer = TextRecognizer(script: TextRecognitionScript.chinese);
++      final recognized = await recognizer.processImage(prepared.input);
++      final text = _cleanBlocks(recognized.blocks);
++      _logger.info(
++        'OCR finished for $imagePath: ${recognized.blocks.length} blocks, '
++        '${text.length} chars',
++      );
++      return text;
++    } catch (e) {
++      // Always fall back to "no text" so the original image is kept.
++      _logger.warning('OCR failed for $imagePath: $e');
++      return '';
++    } finally {
++      try {
++        recognizer?.close();
++      } catch (_) {
++        // Closing a half-initialized recognizer can throw; nothing to do.
++      }
++      if (tmpDirPath != null) {
++        // ML Kit has already consumed the bytes by now.
++        await _deleteQuietly(tmpDirPath);
++      }
++    }
++  }
++
++  /// Whether [text] carries enough content to justify dropping the photo.
++  bool isUseful(String text) => _meaningfulCharCount(text) >= _minUsefulChars;
++
++  Future<({InputImage input, String? tmpDirPath})?> _prepareInput(
++    String imagePath,
++    int? longEdge,
++  ) async {
++    if (longEdge == null || longEdge <= _maxLongEdge) {
++      return (input: InputImage.fromFilePath(imagePath), tmpDirPath: null);
++    }
++    // Too large: OCR a downsampled copy in a temp dir. The original stays
++    // untouched whether or not we end up keeping it.
++    String? tmpDirPath;
++    try {
++      final tmpDir = await Directory.systemTemp.createTemp('memex_ocr_');
++      tmpDirPath = tmpDir.path;
++      final tmpPath = '${tmpDir.path}/ocr_input.jpg';
++      final wrote = await compute(_writeDownsampledJpeg, <String, dynamic>{
++        'path': imagePath,
++        'target': _maxLongEdge,
++        'out': tmpPath,
++      });
++      if (!wrote) {
++        await _deleteQuietly(tmpDirPath);
++        return (input: InputImage.fromFilePath(imagePath), tmpDirPath: null);
++      }
++      return (input: InputImage.fromFilePath(tmpPath), tmpDirPath: tmpDirPath);
++    } catch (e) {
++      _logger.warning('Downsample for OCR failed, using original: $e');
++      if (tmpDirPath != null) await _deleteQuietly(tmpDirPath);
++      return (input: InputImage.fromFilePath(imagePath), tmpDirPath: null);
++    }
++  }
++
++  Future<void> _deleteQuietly(String path) async {
++    try {
++      await Directory(path).delete(recursive: true);
++    } catch (_) {}
++  }
++
++  /// Join blocks with a blank line, keeping intra-block line breaks, and stitch
++  /// CJK lines that the recognizer split mid-sentence.
++  String _cleanBlocks(List<TextBlock> blocks) {
++    final buffer = StringBuffer();
++    for (final block in blocks) {
++      final blockText = _joinLines(block.lines.map((l) => l.text).toList());
++      if (blockText.isEmpty) continue;
++      if (buffer.isNotEmpty) buffer.write('\n\n');
++      buffer.write(blockText);
++    }
++    return buffer.toString().trim();
++  }
++
++  String _joinLines(List<String> lines) {
++    final out = <String>[];
++    for (final raw in lines) {
++      final line = _normalizeLine(raw);
++      if (line.isEmpty) continue;
++      if (out.isNotEmpty && _shouldStitch(out.last, line)) {
++        out.last = '${out.last}${line.trimLeft()}';
++      } else {
++        out.add(line);
++      }
++    }
++    return out.join('\n');
++  }
++
++  /// Normalize whitespace only — the text itself is passed through untouched.
++  String _normalizeLine(String raw) {
++    if (raw.trim().isEmpty) return '';
++    return raw.trimRight().trimLeft();
++  }
++
++  /// CJK text wraps without spaces; a recognizer line break in the middle of a
++  /// sentence is an artifact, not structure. Stitch when the previous line does
++  /// not end a sentence and the next one does not start a list/number/heading.
++  bool _shouldStitch(String prev, String next) {
++    final trimmedPrev = prev.trimRight();
++    if (trimmedPrev.isEmpty) return false;
++    final last = trimmedPrev.codeUnitAt(trimmedPrev.length - 1);
++    const sentenceEnd = '。！？；：.!?;:，,、）」』”"\')】]}';
++    if (sentenceEnd.runes.contains(last)) return false;
++    final trimmedNext = next.trimLeft();
++    if (trimmedNext.isEmpty) return false;
++    if (RegExp(r'^[-*•·#]').hasMatch(trimmedNext)) return false;
++    if (RegExp(r'^\d+[.、)）]').hasMatch(trimmedNext)) return false;
++    final first = trimmedNext.codeUnitAt(0);
++    final isCjk = (first >= 0x4E00 && first <= 0x9FFF) ||
++        (first >= 0x3400 && first <= 0x4DBF) ||
++        (first >= 0x3000 && first <= 0x303F) ||
++        (first >= 0xFF00 && first <= 0xFFEF);
++    return isCjk;
++  }
++
++  int _meaningfulCharCount(String text) {
++    var count = 0;
++    for (final rune in text.runes) {
++      if (rune <= 0x20) continue;
++      count += 1;
++    }
++    return count;
++  }
++}
++
++/// Runs on an isolate: decode, clamp the long edge to `target`, re-encode JPEG.
++/// Returns true when [out] was written.
++bool _writeDownsampledJpeg(Map<String, dynamic> args) {
++  try {
++    final input = File(args['path'] as String).readAsBytesSync();
++    final decoded = img.decodeImage(input);
++    if (decoded == null) return false;
++    final target = args['target'] as int;
++    final longEdge =
++        decoded.width > decoded.height ? decoded.width : decoded.height;
++    final resized = longEdge <= target
++        ? decoded
++        : img.copyResize(
++            decoded,
++            width: decoded.width >= decoded.height ? target : null,
++            height: decoded.height > decoded.width ? target : null,
++            interpolation: img.Interpolation.average,
++          );
++    final bytes = img.encodeJpg(resized, quality: 90);
++    File(args['out'] as String).writeAsBytesSync(bytes);
++    return true;
++  } catch (_) {
++    return false;
++  }
++}
+diff --git a/lib/l10n/app_en.arb b/lib/l10n/app_en.arb
+index e9e122a..02aeb13 100644
+--- a/lib/l10n/app_en.arb
++++ b/lib/l10n/app_en.arb
+@@ -261,7 +261,6 @@
+     }
+   },
+   "loadHistoryFailed": "Failed to load history: {error}",
+-
+   "reload": "Reload",
+   "aiInsightDetail": "Insight Detail",
+   "@relatedRecordsCount": {
+@@ -479,7 +478,6 @@
+   "reAuthorize": "Re-authorize",
+   "authorizeWithOpenAi": "Authorize with OpenAI",
+   "authorizeWithGoogle": "Authorize with Google",
+-
+   "config": "Config",
+   "calendar": "Calendar",
+   "reminders": "Reminders",
+@@ -1550,5 +1548,11 @@
+   },
+   "taskCompletedLabel": "Completed: {date}",
+   "oauthCouldNotLaunchBrowser": "Could not launch browser for OAuth",
+-  "authorizationTimedOut": "Authorization timed out"
++  "authorizationTimedOut": "Authorization timed out",
++  "ocrDiscardOriginalTitle": "Discard original after OCR",
++  "ocrDiscardOriginalSubtitle": "Recognize text in photos before sending; when text is found the photo is not saved at all. All processing happens on device.",
++  "ocrRecognizing": "Recognizing text…",
++  "ocrNoTextFound": "No text found — sending the original photos",
++  "ocrBadgeToText": "To text",
++  "ocrTextPrefix": "Image text"
+ }
+diff --git a/lib/l10n/app_zh.arb b/lib/l10n/app_zh.arb
+index 8d50a35..dbef5ce 100644
+--- a/lib/l10n/app_zh.arb
++++ b/lib/l10n/app_zh.arb
+@@ -261,7 +261,6 @@
+     }
+   },
+   "loadHistoryFailed": "加载历史记录失败：{error}",
+-
+   "reload": "重新加载",
+   "aiInsightDetail": "洞察详情",
+   "@relatedRecordsCount": {
+@@ -479,7 +478,6 @@
+   "reAuthorize": "重新授权",
+   "authorizeWithOpenAi": "使用 OpenAI 授权",
+   "authorizeWithGoogle": "使用 Google 授权",
+-
+   "config": "配置",
+   "calendar": "日历",
+   "reminders": "提醒事项",
+@@ -1504,5 +1502,11 @@
+     "placeholders": {
+       "week": {}
+     }
+-  }
++  },
++  "ocrDiscardOriginalTitle": "OCR 后自动丢弃原图",
++  "ocrDiscardOriginalSubtitle": "发图前先在手机本地识别文字，识别到文字就只发送文字、不保存原图。",
++  "ocrRecognizing": "正在识别图片文字…",
++  "ocrNoTextFound": "未识别到文字，已按原图发送",
++  "ocrBadgeToText": "转文字",
++  "ocrTextPrefix": "图片文字"
+ }
+diff --git a/lib/l10n/app_zh_Hant.arb b/lib/l10n/app_zh_Hant.arb
+index 62b3caf..db04202 100644
+--- a/lib/l10n/app_zh_Hant.arb
++++ b/lib/l10n/app_zh_Hant.arb
+@@ -261,7 +261,6 @@
+     }
+   },
+   "loadHistoryFailed": "載入歷史記錄失敗：{error}",
+-
+   "reload": "重新載入",
+   "aiInsightDetail": "洞察詳情",
+   "relatedRecordsCount": "關聯記錄（{count}）",
+@@ -479,7 +478,6 @@
+   "reAuthorize": "重新授權",
+   "authorizeWithOpenAi": "使用 OpenAI 授權",
+   "authorizeWithGoogle": "使用 Google 授權",
+-
+   "config": "設定",
+   "calendar": "行事曆",
+   "reminders": "提醒事項",
+@@ -1550,5 +1548,11 @@
+     "placeholders": {
+       "week": {}
+     }
+-  }
++  },
++  "ocrDiscardOriginalTitle": "OCR 後自動丟棄原圖",
++  "ocrDiscardOriginalSubtitle": "發圖前先在手機本地辨識文字，辨識到文字就只傳送文字、不儲存原圖。",
++  "ocrRecognizing": "正在辨識圖片文字…",
++  "ocrNoTextFound": "未辨識到文字，已按原圖傳送",
++  "ocrBadgeToText": "轉文字",
++  "ocrTextPrefix": "圖片文字"
+ }
+diff --git a/lib/ui/chat/widgets/agent_chat_dialog.dart b/lib/ui/chat/widgets/agent_chat_dialog.dart
+index 0fe3031..fef26b2 100644
+--- a/lib/ui/chat/widgets/agent_chat_dialog.dart
++++ b/lib/ui/chat/widgets/agent_chat_dialog.dart
+@@ -528,6 +528,13 @@ class _AgentChatDialogState extends State<AgentChatDialog>
+   final ImagePicker _imagePicker = ImagePicker();
+   final List<XFile> _selectedImages = [];
+   final Map<String, String> _originalFilenames = {};
++
++  /// Mirrors the "discard original after OCR" setting so the composer can badge
++  /// staged photos; the actual decision is re-read in ChatService.sendMessage.
++  bool _ocrDiscardImages = false;
++
++  /// True while the on-device OCR pass is running on send.
++  bool _isRecognizingImages = false;
+   StreamSubscription<ChatEvent>? _chatSubscription;
+   final List<StreamSubscription<ChatEvent>> _queuedSendSubscriptions = [];
+   Timer? _draftSaveDebounce;
+@@ -553,6 +560,7 @@ class _AgentChatDialogState extends State<AgentChatDialog>
+ 
+   @override
+   void initState() {
++    unawaited(_loadOcrDiscardSetting());
+     super.initState();
+     _chatEventBatcher = ChatEventBatcher(
+       apply: _applyChatEvent,
+@@ -1393,6 +1401,15 @@ class _AgentChatDialogState extends State<AgentChatDialog>
+     );
+   }
+ 
++
++  Future<void> _loadOcrDiscardSetting() async {
++    final enabled = await UserStorage.getOcrDiscardImage();
++    if (!mounted) return;
++    if (enabled != _ocrDiscardImages) {
++      setState(() => _ocrDiscardImages = enabled);
++    }
++  }
++
+   Future<void> _pickImage(ImageSource source) async {
+     try {
+       if (source == ImageSource.camera) {
+@@ -1671,6 +1688,12 @@ class _AgentChatDialogState extends State<AgentChatDialog>
+         }
+         _items.add(ErrorItem(event.error));
+         _forceNextChatScroll = true;
++      } else if (event is ChatOcrStatusEvent) {
++        if (mounted) setState(() => _isRecognizingImages = event.isRunning);
++      } else if (event is ChatOcrDiscardedEvent) {
++        if (event.keptCount > 0) {
++          ToastHelper.showInfo(context, UserStorage.l10n.ocrNoTextFound);
++        }
+       }
+   }
+ 
+@@ -2300,6 +2323,45 @@ class _AgentChatDialogState extends State<AgentChatDialog>
+   }
+ 
+   Widget _buildSuperAgentInput() {
++    final input = _buildSuperAgentInputBody();
++    if (!_isRecognizingImages) return input;
++    // On-device OCR blocks the send for a second or two; show a light scrim so
++    // the tap never feels ignored.
++    return Stack(
++      children: [
++        input,
++        Positioned.fill(
++          child: AbsorbPointer(
++            child: ColoredBox(
++              color: Colors.white.withValues(alpha: 0.82),
++              child: Center(
++                child: Row(
++                  mainAxisSize: MainAxisSize.min,
++                  children: [
++                    const SizedBox(
++                      width: 16,
++                      height: 16,
++                      child: CircularProgressIndicator(strokeWidth: 2),
++                    ),
++                    const SizedBox(width: 10),
++                    Text(
++                      UserStorage.l10n.ocrRecognizing,
++                      style: const TextStyle(
++                        fontSize: 13,
++                        color: AppColors.textSecondary,
++                      ),
++                    ),
++                  ],
++                ),
++              ),
++            ),
++          ),
++        ),
++      ],
++    );
++  }
++
++  Widget _buildSuperAgentInputBody() {
+     return Container(
+       padding: const EdgeInsets.fromLTRB(16, 12, 16, 16),
+       decoration: const BoxDecoration(
+@@ -2657,6 +2719,34 @@ class _AgentChatDialogState extends State<AgentChatDialog>
+             fit: BoxFit.cover,
+           ),
+         ),
++        if (_ocrDiscardImages)
++          Positioned(
++            left: 0,
++            right: 0,
++            bottom: 0,
++            child: Container(
++              padding: const EdgeInsets.symmetric(vertical: 3),
++              decoration: const BoxDecoration(
++                color: Colors.black54,
++                borderRadius: BorderRadius.only(
++                  bottomLeft: Radius.circular(14),
++                  bottomRight: Radius.circular(14),
++                ),
++              ),
++              child: Text(
++                UserStorage.l10n.ocrBadgeToText,
++                textAlign: TextAlign.center,
++                maxLines: 1,
++                overflow: TextOverflow.ellipsis,
++                style: const TextStyle(
++                  fontSize: 10,
++                  height: 1.1,
++                  color: Colors.white,
++                  fontWeight: FontWeight.w500,
++                ),
++              ),
++            ),
++          ),
+         Positioned(
+           top: -6,
+           right: -6,
+diff --git a/lib/ui/settings/widgets/settings_page.dart b/lib/ui/settings/widgets/settings_page.dart
+index 1af3cdd..e2ba38a 100644
+--- a/lib/ui/settings/widgets/settings_page.dart
++++ b/lib/ui/settings/widgets/settings_page.dart
+@@ -30,6 +30,7 @@ class SettingsPage extends StatefulWidget {
+ class _SettingsPageState extends State<SettingsPage> {
+   String _currentLocaleTag = 'en';
+   bool _useLocalSpeechToText = true;
++  bool _ocrDiscardImage = false;
+   CommentSettings _commentSettings = const CommentSettings();
+ 
+   @override
+@@ -41,6 +42,7 @@ class _SettingsPageState extends State<SettingsPage> {
+   Future<void> _loadSettings() async {
+     final locale = await UserStorage.getLocale();
+     final useLocalSpeechToText = await UserStorage.getUseLocalSpeechToText();
++    final ocrDiscardImage = await UserStorage.getOcrDiscardImage();
+     final commentSettings = await MemexRouter().getCommentSettings();
+     if (mounted) {
+       setState(() {
+@@ -48,11 +50,19 @@ class _SettingsPageState extends State<SettingsPage> {
+           UserStorage.resolveToSupportedLocale(locale),
+         );
+         _useLocalSpeechToText = useLocalSpeechToText;
++        _ocrDiscardImage = ocrDiscardImage;
+         _commentSettings = commentSettings;
+       });
+     }
+   }
+ 
++  Future<void> _updateOcrDiscardImage(bool value) async {
++    await UserStorage.setOcrDiscardImage(value);
++    if (mounted) {
++      setState(() => _ocrDiscardImage = value);
++    }
++  }
++
+   Future<void> _changeLanguage(String localeTag) async {
+     if (_currentLocaleTag == localeTag) return;
+     final locale = UserStorage.localeFromTag(localeTag);
+@@ -396,8 +406,57 @@ class _SettingsPageState extends State<SettingsPage> {
+               ),
+             ),
+           ],
+-          // Data Storage (iOS only — Android has no storage options to choose)
+-          if (Platform.isIOS) ...[
++          // OCR: convert photos to text on send and skip saving the original.
++          // Android only — the iOS build ships a stub for ML Kit.
++          if (Platform.isAndroid) ...[
++            Container(
++              padding: const EdgeInsets.all(20),
++              decoration: BoxDecoration(
++                color: Colors.white,
++                borderRadius: BorderRadius.circular(16),
++                boxShadow: [
++                  BoxShadow(
++                    color: AppColors.textSecondary.withValues(alpha: 0.08),
++                    blurRadius: 16,
++                    offset: const Offset(0, 4),
++                  ),
++                ],
++              ),
++              child: SwitchListTile(
++                contentPadding: EdgeInsets.zero,
++                secondary: const Icon(
++                  Icons.text_snippet_outlined,
++                  color: AppColors.primary,
++                  size: 22,
++                ),
++                title: Text(
++                  UserStorage.l10n.ocrDiscardOriginalTitle,
++                  style: const TextStyle(
++                    fontSize: 16,
++                    fontWeight: FontWeight.w500,
++                    color: AppColors.textPrimary,
++                  ),
++                ),
++                subtitle: Padding(
++                  padding: const EdgeInsets.only(top: 6),
++                  child: Text(
++                    UserStorage.l10n.ocrDiscardOriginalSubtitle,
++                    style: TextStyle(
++                      fontSize: 13,
++                      color: Colors.grey[600],
++                      height: 1.4,
++                    ),
++                  ),
++                ),
++                value: _ocrDiscardImage,
++                onChanged: _updateOcrDiscardImage,
++              ),
++            ),
++            const SizedBox(height: 16),
++          ],
++          // Data Storage — both platforms now expose it (Android got the custom
++          // folder option back in this build).
++          if (Platform.isIOS || Platform.isAndroid) ...[
+             const SizedBox(height: 16),
+             Material(
+               color: Colors.transparent,
+diff --git a/lib/utils/user_storage.dart b/lib/utils/user_storage.dart
+index 6769676..a0f4005 100644
+--- a/lib/utils/user_storage.dart
++++ b/lib/utils/user_storage.dart
+@@ -459,6 +459,28 @@ class UserStorage {
+   static const String _keyAgentConfigs = 'agent_configs';
+   static const String _keyUseLocalSpeechToText = 'use_local_speech_to_text';
+   static const String _keySuperAgentRunMode = 'super_agent_run_mode';
++  static const String _keyOcrDiscardImage = 'ocr_discard_image_after_recognition';
++
++  /// Whether a chat image should be converted to text and then thrown away
++  /// instead of being saved to facts/assets. Defaults to false — the photo is
++  /// the source of truth unless the user opts in.
++  static Future<bool> getOcrDiscardImage() async {
++    try {
++      final prefs = await SharedPreferences.getInstance();
++      return prefs.getBool(_keyOcrDiscardImage) ?? false;
++    } catch (e) {
++      return false;
++    }
++  }
++
++  static Future<void> setOcrDiscardImage(bool value) async {
++    try {
++      final prefs = await SharedPreferences.getInstance();
++      await prefs.setBool(_keyOcrDiscardImage, value);
++    } catch (e) {
++      throw Exception('Failed to save OCR preference: $e');
++    }
++  }
+ 
+   /// Persisted run mode for the SuperAgent home entry ('auto' | 'confirm' |
+   /// 'read_only'). Defaults to 'auto'.
