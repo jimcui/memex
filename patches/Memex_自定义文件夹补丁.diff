@@ -1,0 +1,82 @@
+diff --git a/android/app/src/main/AndroidManifest.xml b/android/app/src/main/AndroidManifest.xml
+index 4c328b4..222c5f9 100644
+--- a/android/app/src/main/AndroidManifest.xml
++++ b/android/app/src/main/AndroidManifest.xml
+@@ -3,7 +3,8 @@
+     <uses-permission android:name="android.permission.RECORD_AUDIO" />
+     <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" />
+     <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" />
+-    <!-- MANAGE_EXTERNAL_STORAGE removed for Google Play policy compliance -->
++    <!-- Android 11+ all files access for custom workspace folder (restored) -->
++    <uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE" tools:ignore="ScopedStorage" />
+     <uses-permission android:name="android.permission.CAMERA" />
+     <uses-permission android:name="android.permission.USE_BIOMETRIC"/>
+     <!-- Media location permission for accessing GPS info in images -->
+diff --git a/lib/ui/settings/widgets/data_storage_page.dart b/lib/ui/settings/widgets/data_storage_page.dart
+index 0ad6eea..1ae225c 100644
+--- a/lib/ui/settings/widgets/data_storage_page.dart
++++ b/lib/ui/settings/widgets/data_storage_page.dart
+@@ -2,6 +2,7 @@ import 'dart:io';
+ import 'package:flutter/material.dart';
+ import 'package:google_fonts/google_fonts.dart';
+ import 'package:file_picker/file_picker.dart';
++import 'package:permission_handler/permission_handler.dart';
+ import 'package:memex/data/repositories/memex_router.dart';
+ import 'package:memex/data/services/backup_service.dart';
+ import 'package:memex/utils/user_storage.dart';
+@@ -68,6 +69,33 @@ class _DataStoragePageState extends State<DataStoragePage> {
+     }
+   }
+ 
++  /// Ensure Android 11+ "All files access" is granted. If it is not, open the
++  /// system settings page and tell the user to come back and tap again.
++  Future<bool> _ensureAllFilesAccess() async {
++    try {
++      final status = await Permission.manageExternalStorage.status;
++      if (status.isGranted) return true;
++      if (status.isPermanentlyDenied) {
++        await openAppSettings();
++        if (mounted) {
++          ToastHelper.showInfo(
++              context, UserStorage.l10n.customFolderAccessDenied);
++        }
++        return false;
++      }
++      final result = await Permission.manageExternalStorage.request();
++      if (result.isGranted) return true;
++      if (mounted) {
++        ToastHelper.showInfo(
++            context, UserStorage.l10n.customFolderAccessDenied);
++      }
++      return false;
++    } catch (_) {
++      // Permission plugin unavailable: let the write test decide.
++      return true;
++    }
++  }
++
+   /// Verify we can read/write the path (create and delete a test file). Returns true if OK.
+   Future<bool> _verifyPathWritable(String path) async {
+     try {
+@@ -92,6 +120,11 @@ class _DataStoragePageState extends State<DataStoragePage> {
+       }
+       return;
+     }
++    // Android 11+ requires "All files access" (MANAGE_EXTERNAL_STORAGE) to write
++    // outside the app sandbox via a plain directory path.
++    if (!await _ensureAllFilesAccess()) {
++      return;
++    }
+     final path = await FilePicker.platform.getDirectoryPath();
+     if (path == null || path.isEmpty || !mounted) return;
+     final canWrite = await _verifyPathWritable(path);
+@@ -275,7 +308,8 @@ class _DataStoragePageState extends State<DataStoragePage> {
+       add(iCloudCard);
+       add(appCard);
+     } else {
+-      // Android: only app storage (custom folder removed for Google Play policy compliance)
++      // Android: restore custom folder option (removed upstream for Google Play policy compliance)
++      add(customCard);
+       add(appCard);
+     }
+ 
