@@ -1,0 +1,27 @@
+--- a/lib/src/llm/openai_client.dart (dart_agent_core-2.1.6 原版)	2026-10-25 04:23:19.463131008 +0800
++++ b/lib/src/llm/openai_client.dart (已修补)	2026-10-25 04:23:19.401131243 +0800
+@@ -352,6 +352,24 @@
+             )
+             .toList();
+       }
++      // An assistant message with neither content nor tool_calls is rejected
++      // by OpenAI-compatible endpoints ("Invalid assistant message"). This
++      // happens when a run was interrupted mid-stream (network loss, process
++      // death) and the persisted history kept a thought-only or empty
++      // assistant turn. Recover: fall back to the reasoning text as content,
++      // or drop the message entirely when there is nothing to show. Safe to
++      // drop because function results only ever follow tool_calls, and this
++      // message has none.
++      final hasContent =
++          msg['content'] != null && (msg['content'] as String).isNotEmpty;
++      if (!hasContent && msg['tool_calls'] == null) {
++        final thought = m.thought;
++        if (thought != null && thought.isNotEmpty) {
++          msg['content'] = thought;
++        } else {
++          continue;
++        }
++      }
+       finalMessages.add(msg);
+     } else if (m is FunctionExecutionResultMessage) {
+       for (final res in m.results) {
